@@ -47,7 +47,7 @@ main{width:min(100%,680px);margin:0 auto;padding:10px 0 24px}.top{display:flex;a
     <div class="buttons"><button id="startBtn" class="primary">▶ Start monitoring</button><button id="stopBtn" class="stop" disabled>■ Stop</button></div>
     <div id="runStatus" class="statusline">Ready. Monitoring starts when you press Start.</div>
     <div class="stats"><div class="stat"><b id="elapsed">00:00:00</b><small>RUN TIME</small></div><div class="stat"><b id="matches">0</b><small>MATCHED CHAT MESSAGES</small></div><div class="stat"><b id="sent">0</b><small>TELEGRAM MESSAGES SENT</small></div></div>
-    <p class="hint" id="quotaUsage">YouTube chat polling costs 5 quota units per request. The app waits at least 9 seconds between polls to help fit a 4.5-hour run within the typical 10,000-unit daily quota.</p>
+    <p class="hint" id="quotaUsage">YouTube chat polling costs 5 quota units per request. At 15-second intervals that is up to 1,200 units per active hour; the app also sleeps for 15 minutes after each match cycle.</p>
     <div class="notice">Keep this page open and visible in split-screen for best results. Screen Wake Lock prevents the display from sleeping while this page is visible; it does not keep Android or Chrome running in the background.</div>
   </section>
 
@@ -64,11 +64,12 @@ main{width:min(100%,680px);margin:0 auto;padding:10px 0 24px}.top{display:flex;a
   const $ = id => document.getElementById(id);
   const STORAGE_KEY = 'chatwatch.settings.v1';
   const fields = ['apiKey','botToken','chatId','streamUrl','stopHours','userFilter','keywordRules'];
+  const POLL_INTERVAL_MS = 15000, POST_MATCH_MONITOR_MS = 120000, MATCH_SLEEP_MS = 900000;
   let running = false, runStartedAt = 0, stopAt = 0, timerId = null, pollTimer = null, wakeLock = null;
-  let liveChatId = '', nextPageToken = '', pollDelay = 5000, matchedCount = 0, sentCount = 0;
+  let liveChatId = '', nextPageToken = '', pollDelay = POLL_INTERVAL_MS, postMatchMonitorUntil = 0, sleepUntil = 0, matchedCount = 0, sentCount = 0;
   let allowedUsers = [], ruleList = [], seenIds = new Set(), sendQueue = Promise.resolve(), lastSendAt = 0;
   let pollCalls = 0, quotaEstimate = 0;
-  function updateQuota(){ $('quotaUsage').textContent='Estimated YouTube quota: '+quotaEstimate.toLocaleString()+' units ('+pollCalls+' chat polls × 5, plus video/channel lookups).'; }
+  function updateQuota(){ $('quotaUsage').textContent='Estimated YouTube quota: '+quotaEstimate.toLocaleString()+' units ('+pollCalls+' chat polls × 5; up to 1,200 units per active hour at 15-second intervals, plus video/channel lookups).'; }
 
   function saveSettings(){
     const data = {}; fields.forEach(id => data[id] = $(id).value);
@@ -188,6 +189,10 @@ main{width:min(100%,680px);margin:0 auto;padding:10px 0 24px}.top{display:flex;a
     const hits=ruleList.filter(r=>text.toLocaleLowerCase().includes(r.keyword));
     if(!hits.length) return;
     matchedCount++; $('matches').textContent=matchedCount;
+    if(!postMatchMonitorUntil){
+      postMatchMonitorUntil=Date.now()+POST_MATCH_MONITOR_MS;
+      log('Match cycle started: monitoring will continue for 2 minutes, then sleep for 15 minutes.','warn');
+    }
     const name=author.displayName||'Unknown author';
     log('MATCH: '+name+' — '+text,'warn');
     for(const rule of hits){
@@ -201,6 +206,16 @@ main{width:min(100%,680px);margin:0 auto;padding:10px 0 24px}.top{display:flex;a
   async function poll(){
     if(!running) return;
     if(Date.now()>=stopAt){ stopMonitoring('Auto-stop timer finished.'); return; }
+    if(sleepUntil && Date.now()<sleepUntil){
+      const sleepSeconds=Math.ceil((sleepUntil-Date.now())/1000);
+      status('Sleeping to save YouTube quota · next check in '+Math.ceil(sleepSeconds/60)+'m '+(sleepSeconds%60)+'s');
+      pollTimer=setTimeout(poll,Math.min(sleepUntil-Date.now(),1000));
+      return;
+    }
+    if(sleepUntil && Date.now()>=sleepUntil){
+      sleepUntil=0; postMatchMonitorUntil=0;
+      log('Quota-saving sleep finished. Monitoring resumed.','ok');
+    }
     try{
       pollCalls++; quotaEstimate+=5; updateQuota();
       const params={liveChatId:liveChatId,part:'snippet,authorDetails',maxResults:2000};
@@ -208,15 +223,24 @@ main{width:min(100%,680px);margin:0 auto;padding:10px 0 24px}.top{display:flex;a
       const data=await youtubeGet('liveChat/messages',params);
       (data.items||[]).forEach(processMessage);
       nextPageToken=data.nextPageToken||nextPageToken;
-      // The endpoint costs 5 quota units per request. A 9-second floor keeps a 4.5-hour run near 9,000 units.
-      pollDelay=Math.max(9000,Number(data.pollingIntervalMillis)||5000);
+      // The endpoint costs 5 quota units per request. A 15-second floor reduces usage during a run.
+      pollDelay=Math.max(POLL_INTERVAL_MS,Number(data.pollingIntervalMillis)||POLL_INTERVAL_MS);
       $('runStatus').textContent='Monitoring live chat · next check in '+Math.ceil(pollDelay/1000)+'s';
       if(data.offlineAt){ stopMonitoring('The livestream has ended.'); return; }
       if(Date.now()>=stopAt){ stopMonitoring('Auto-stop timer finished.'); return; }
+      if(postMatchMonitorUntil && Date.now()>=postMatchMonitorUntil){
+        sleepUntil=Math.min(stopAt,Date.now()+MATCH_SLEEP_MS);
+        postMatchMonitorUntil=0;
+        if(sleepUntil<=Date.now()){ stopMonitoring('Auto-stop timer finished.'); return; }
+        log('Two-minute post-match monitoring finished. Sleeping for 15 minutes to save quota.','warn');
+        status('Sleeping to save YouTube quota · next check in 15m');
+        pollTimer=setTimeout(poll,1000);
+        return;
+      }
       pollTimer=setTimeout(poll,pollDelay);
     }catch(e){
       log('YouTube polling error: '+e.message,'error'); status('YouTube API error. Retrying after 15 seconds.','bad');
-      pollTimer=setTimeout(poll,15000);
+      pollTimer=setTimeout(poll,POLL_INTERVAL_MS);
     }
   }
   async function requestWakeLock(){
@@ -228,7 +252,7 @@ main{width:min(100%,680px);margin:0 auto;padding:10px 0 24px}.top{display:flex;a
   document.addEventListener('visibilitychange',()=>{if(running && document.visibilityState==='visible') requestWakeLock();});
   function stopMonitoring(reason='Stopped by user.'){
     if(!running) return;
-    setRunning(false); clearTimeout(pollTimer); clearInterval(timerId); releaseWakeLock();
+    setRunning(false); clearTimeout(pollTimer); clearInterval(timerId); postMatchMonitorUntil=0; sleepUntil=0; releaseWakeLock();
     status(reason,''); log(reason,'warn');
   }
   $('stopBtn').addEventListener('click',()=>stopMonitoring('Stopped by user.'));
@@ -247,7 +271,7 @@ main{width:min(100%,680px);margin:0 auto;padding:10px 0 24px}.top{display:flex;a
       liveChatId=video.items[0].liveStreamingDetails?.activeLiveChatId||'';
       if(!liveChatId) throw new Error('No active public live chat found. The stream may not be live, chat may be disabled, or the video may be private.');
       allowedUsers=await resolveUsers();
-      runStartedAt=Date.now(); stopAt=runStartedAt+hours*3600000; nextPageToken=''; seenIds=new Set(); matchedCount=0; sentCount=0; lastSendAt=0; sendQueue=Promise.resolve(); pollCalls=0; updateQuota();
+      runStartedAt=Date.now(); stopAt=runStartedAt+hours*3600000; nextPageToken=''; postMatchMonitorUntil=0; sleepUntil=0; seenIds=new Set(); matchedCount=0; sentCount=0; lastSendAt=0; sendQueue=Promise.resolve(); pollCalls=0; updateQuota();
       $('matches').textContent='0'; $('sent').textContent='0';
       setRunning(true); status('Connected. Monitoring started.','good'); log('Monitoring started for video '+videoIdForLog+'. Alerts from before the Start button press will be ignored.','ok');
       if(allowedUsers.length) log('User filter enabled for '+allowedUsers.length+' entry/entries.',''); else log('User filter is blank: monitoring all chat users.','');
